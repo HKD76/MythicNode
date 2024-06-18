@@ -40,6 +40,45 @@ const getSummonerByRiotID = async (req, res) => {
   }
 };
 
+const getSummonerByPUUID = async (req, res) => {
+  const { puuid } = req.params;
+  console.log('Received request for PUUID:', puuid);
+
+  const url = `https://euw1.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/${puuid}`;
+  console.log('Calling Riot API with URL:', url);
+  try {
+    const response = await axios.get(url, {
+      headers: { 'X-Riot-Token': RIOT_API_KEY }
+    });
+
+    // console.log('Response from Riot API:', response.data);
+
+    // Save to MySQL
+    // const query = 'INSERT INTO summoners (puuid, summonerName, summonerLevel) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE summonerName=?, summonerLevel=?';
+    // mysqlConnection.query(query, [response.data.puuid, response.data.name, response.data.summonerLevel, response.data.name, response.data.summonerLevel], (err) => {
+    //   if (err) throw err;
+    //   console.log('Summoner data saved to MySQL');
+    // });
+
+    // Save to MongoDB
+    // const mongoDb = await connectToMongo();
+    // mongoDb.collection('summoners').updateOne(
+    //   { puuid: response.data.puuid },
+    //   { $set: response.data },
+    //   { upsert: true },
+    //   (err) => {
+    //     if (err) throw err;
+    //     console.log('Summoner data saved to MongoDB');
+    //   }
+    // );
+
+    res.json(response.data);
+  } catch (error) {
+    // console.error('Error fetching data from Riot API:', error);
+    res.status(500).send(error.toString());
+  }
+};
+
 const getMatchHistory = async (req, res) => {
   const { puuid } = req.params;
 
@@ -112,5 +151,6 @@ module.exports = {
   getSummonerByRiotID,
   getMatchDetails,
   getRankedStats,
-  getChampionMastery
+  getChampionMastery,
+  getSummonerByPUUID
 };
