@@ -1,6 +1,7 @@
 const axios = require("axios");
 const { handleError } = require("../utils/errorHandler");
 const { saveToMongo } = require("../utils/mongoHelper");
+const { query } = require("../utils/mysqlHelper");
 
 const RIOT_API_KEY = process.env.RIOT_API_KEY;
 
@@ -14,7 +15,6 @@ const getSummonerByRiotID = async (req, res) => {
     );
 
     const accountData = response.data;
-
     const { puuid, gameName, tagLine } = accountData;
 
     const summonerResponse = await axios.get(
@@ -23,7 +23,6 @@ const getSummonerByRiotID = async (req, res) => {
     );
 
     const summonerData = summonerResponse.data;
-    console.log("summonerData", summonerData);
     const { id, accountId, profileIconId, summonerLevel } = summonerData;
 
     const dataToSave = {
@@ -46,10 +45,8 @@ const getSummonerByRiotID = async (req, res) => {
 
 const getSummonerByPUUID = async (req, res) => {
   const { puuid } = req.params;
-  console.log("Received request for PUUID:", puuid);
 
   const url = `https://euw1.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/${puuid}`;
-  console.log("Calling Riot API with URL:", url);
 
   try {
     const response = await axios.get(url, {
@@ -78,28 +75,16 @@ const getSummonerByPUUID = async (req, res) => {
 const getMatchHistory = async (req, res) => {
   const { puuid } = req.params;
 
-  console.log("Request received for match history");
-  console.log("PUUID:", puuid);
-
   const url = `https://europe.api.riotgames.com/lol/match/v5/matches/by-puuid/${puuid}/ids`;
-
-  console.log("Calling Riot API with URL:", url);
 
   try {
     const response = await axios.get(url, {
       headers: { "X-Riot-Token": RIOT_API_KEY },
     });
 
-    console.log("Riot API response status:", response.status);
-    console.log("Riot API response data:", response.data);
-
     res.json(response.data);
   } catch (error) {
-    console.error(
-      "Error fetching match history:",
-      error.response ? error.response.data : error.message
-    );
-    res.status(500).send(error.response ? error.response.data : error.message);
+    handleError(res, error);
   }
 };
 
@@ -114,8 +99,44 @@ const getMatchDetails = async (req, res) => {
       }
     );
 
-    res.json(response.data);
+    const matchData = response.data;
+
+    const playerStats = matchData.info.participants.map((participant) => ({
+      puuid: participant.puuid,
+      match_id: matchId,
+      kills: participant.kills,
+      deaths: participant.deaths,
+      assists: participant.assists,
+      gold_earned: participant.goldEarned,
+      total_minions_killed: participant.totalMinionsKilled,
+      damage_dealt: participant.totalDamageDealtToChampions,
+      game_duration: matchData.info.gameDuration,
+      match_date: new Date(matchData.info.gameCreation).toISOString(),
+    }));
+
+    const insertPromises = playerStats.map((stats) =>
+      query(
+        "INSERT INTO match_stats (puuid, match_id, kills, deaths, assists, gold_earned, total_minions_killed, damage_dealt, game_duration, match_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+          stats.puuid,
+          stats.match_id,
+          stats.kills,
+          stats.deaths,
+          stats.assists,
+          stats.gold_earned,
+          stats.total_minions_killed,
+          stats.damage_dealt,
+          stats.game_duration,
+          stats.match_date,
+        ]
+      )
+    );
+
+    await Promise.all(insertPromises);
+
+    res.json(matchData);
   } catch (error) {
+    console.error("Error in getMatchDetails:", error);
     res.status(500).send(error.toString());
   }
 };
@@ -139,7 +160,7 @@ const getRankedStats = async (req, res) => {
 
     res.json(rankedStats);
   } catch (error) {
-    res.status(500).send(error.toString());
+    handleError(res, error);
   }
 };
 
@@ -156,7 +177,7 @@ const getChampionMastery = async (req, res) => {
 
     res.json(response.data);
   } catch (error) {
-    res.status(500).send(error.toString());
+    handleError(res, error);
   }
 };
 
@@ -181,19 +202,64 @@ const getRecentMatchesDetails = async (req, res) => {
 
     console.log("matchIds", matchIds);
 
-    const matchDetailsPromises = matchIds.map((matchId) =>
-      axios.get(
-        `https://europe.api.riotgames.com/lol/match/v5/matches/${matchId}`,
-        {
-          headers: { "X-Riot-Token": RIOT_API_KEY },
-        }
-      )
-    );
+    const matchDetailsPromises = matchIds.map(async (matchId) => {
+      try {
+        const response = await axios.get(
+          `https://europe.api.riotgames.com/lol/match/v5/matches/${matchId}`,
+          {
+            headers: { "X-Riot-Token": RIOT_API_KEY },
+          }
+        );
 
-    const matchDetailsResponses = await Promise.all(matchDetailsPromises);
+        const matchData = response.data;
 
-    const matchDetails = matchDetailsResponses.map((response) => response.data);
+        const playerStats = matchData.info.participants.map((participant) => ({
+          puuid: participant.puuid,
+          match_id: matchId,
+          kills: participant.kills,
+          deaths: participant.deaths,
+          assists: participant.assists,
+          gold_earned: participant.goldEarned,
+          total_minions_killed: participant.totalMinionsKilled,
+          damage_dealt: participant.totalDamageDealtToChampions,
+          game_duration: matchData.info.gameDuration,
+          match_date: new Date(matchData.info.gameCreation)
+            .toISOString()
+            .slice(0, 19)
+            .replace("T", " "),
+        }));
 
+        const insertPromises = playerStats.map((stats) =>
+          query(
+            "INSERT INTO match_stats (puuid, match_id, kills, deaths, assists, gold_earned, total_minions_killed, damage_dealt, game_duration, match_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE match_id = match_id",
+            [
+              stats.puuid,
+              stats.match_id,
+              stats.kills,
+              stats.deaths,
+              stats.assists,
+              stats.gold_earned,
+              stats.total_minions_killed,
+              stats.damage_dealt,
+              stats.game_duration,
+              stats.match_date,
+            ]
+          )
+        );
+
+        await Promise.all(insertPromises);
+
+        return matchData;
+      } catch (error) {
+        console.error(
+          `Error fetching match details for matchId ${matchId}:`,
+          error
+        );
+        throw error;
+      }
+    });
+
+    const matchDetails = await Promise.all(matchDetailsPromises);
     res.json(matchDetails);
   } catch (error) {
     console.error("Error fetching match details", error);
@@ -256,6 +322,24 @@ const getServerRank = async (req, res) => {
   }
 };
 
+const getAverageStats = async (req, res) => {
+  try {
+    const avgStats = await query(
+      `SELECT 
+        AVG(kills) as avg_kills,
+        AVG(deaths) as avg_deaths,
+        AVG(assists) as avg_assists,
+        AVG(gold_earned) as avg_gold_earned,
+        AVG(total_minions_killed) as avg_total_minions_killed,
+        AVG(damage_dealt) as avg_damage_dealt
+      FROM match_stats`
+    );
+    res.json(avgStats[0]);
+  } catch (error) {
+    res.status(500).send(error.toString());
+  }
+};
+
 module.exports = {
   getMatchHistory,
   getSummonerByRiotID,
@@ -266,4 +350,5 @@ module.exports = {
   getRecentMatchesDetails,
   getWorldRank,
   getServerRank,
+  getAverageStats,
 };

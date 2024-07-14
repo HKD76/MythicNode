@@ -7,7 +7,6 @@ const configureMiddleware = require("./middleware");
 const app = express();
 const port = 3000;
 
-// Middleware
 configureMiddleware(app);
 
 app.use("/summoner", summonerRoutes);
