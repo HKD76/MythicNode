@@ -17,6 +17,7 @@ router.get(
 );
 router.get("/world-rank/:summonerId", summonerController.getWorldRank);
 router.get("/server-rank/:summonerId", summonerController.getServerRank);
-router.get("/average-stats", summonerController.getAverageStats);
+router.get("/stats/rank/:rank", summonerController.getStatsByRank);
+router.get("/search-users", summonerController.searchUsers);
 
 module.exports = router;

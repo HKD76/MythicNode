@@ -2,6 +2,8 @@ const axios = require("axios");
 const { handleError } = require("../utils/errorHandler");
 const { saveToMongo } = require("../utils/mongoHelper");
 const { query } = require("../utils/mysqlHelper");
+const { MongoClient } = require("mongodb");
+const { connectToMongo } = require("../models/mongodb");
 
 const RIOT_API_KEY = process.env.RIOT_API_KEY;
 
@@ -88,9 +90,7 @@ const getMatchHistory = async (req, res) => {
   }
 };
 
-const getMatchDetails = async (req, res) => {
-  const { matchId } = req.params;
-
+const getMatchDetails = async (matchId) => {
   try {
     const response = await axios.get(
       `https://europe.api.riotgames.com/lol/match/v5/matches/${matchId}`,
@@ -100,44 +100,111 @@ const getMatchDetails = async (req, res) => {
     );
 
     const matchData = response.data;
+    const currentDate = new Date();
+    const maxDate = new Date();
+    maxDate.setDate(currentDate.getDate() - 30);
 
-    const playerStats = matchData.info.participants.map((participant) => ({
-      puuid: participant.puuid,
-      match_id: matchId,
-      kills: participant.kills,
-      deaths: participant.deaths,
-      assists: participant.assists,
-      gold_earned: participant.goldEarned,
-      total_minions_killed: participant.totalMinionsKilled,
-      damage_dealt: participant.totalDamageDealtToChampions,
-      game_duration: matchData.info.gameDuration,
-      match_date: new Date(matchData.info.gameCreation).toISOString(),
-    }));
-
-    const insertPromises = playerStats.map((stats) =>
-      query(
-        "INSERT INTO match_stats (puuid, match_id, kills, deaths, assists, gold_earned, total_minions_killed, damage_dealt, game_duration, match_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-          stats.puuid,
-          stats.match_id,
-          stats.kills,
-          stats.deaths,
-          stats.assists,
-          stats.gold_earned,
-          stats.total_minions_killed,
-          stats.damage_dealt,
-          stats.game_duration,
-          stats.match_date,
-        ]
-      )
+    const rankedPromises = matchData.info.participants.map(
+      async (participant) => {
+        try {
+          const rankedResponse = await axios.get(
+            `https://euw1.api.riotgames.com/lol/league/v4/entries/by-summoner/${participant.summonerId}`,
+            {
+              headers: { "X-Riot-Token": RIOT_API_KEY },
+            }
+          );
+          const soloQueueRank = rankedResponse.data.find(
+            (entry) => entry.queueType === "RANKED_SOLO_5x5"
+          );
+          return soloQueueRank ? soloQueueRank.tier : "Unranked";
+        } catch (error) {
+          console.error(
+            `Error fetching rank for summoner ${participant.summonerId}:`,
+            error
+          );
+          return "Unranked";
+        }
+      }
     );
 
-    await Promise.all(insertPromises);
+    const ranks = await Promise.all(rankedPromises);
 
-    res.json(matchData);
+    const playerStats = matchData.info.participants.map(
+      (participant, index) => ({
+        puuid: participant.puuid,
+        match_id: matchId,
+        kills: participant.kills,
+        deaths: participant.deaths,
+        assists: participant.assists,
+        gold_earned: participant.goldEarned,
+        total_minions_killed: participant.totalMinionsKilled,
+        damage_dealt: participant.totalDamageDealtToChampions,
+        game_duration: matchData.info.gameDuration,
+        match_date: new Date(matchData.info.gameCreation)
+          .toISOString()
+          .slice(0, 19)
+          .replace("T", " "),
+        inserted_at: new Date().toISOString().slice(0, 19).replace("T", " "),
+        rank: ranks[index],
+      })
+    );
+
+    if (new Date(matchData.info.gameCreation) >= maxDate) {
+      const insertPromises = playerStats.map((stats) =>
+        query(
+          `INSERT INTO match_stats 
+          (puuid, match_id, kills, deaths, assists, gold_earned, total_minions_killed, damage_dealt, game_duration, match_date, inserted_at, rank) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) 
+          ON DUPLICATE KEY UPDATE 
+          kills = VALUES(kills), deaths = VALUES(deaths), assists = VALUES(assists), 
+          gold_earned = VALUES(gold_earned), total_minions_killed = VALUES(total_minions_killed), 
+          damage_dealt = VALUES(damage_dealt), game_duration = VALUES(game_duration), 
+          match_date = VALUES(match_date), inserted_at = VALUES(inserted_at), rank = VALUES(rank)`,
+          [
+            stats.puuid,
+            stats.match_id,
+            stats.kills,
+            stats.deaths,
+            stats.assists,
+            stats.gold_earned,
+            stats.total_minions_killed,
+            stats.damage_dealt,
+            stats.game_duration,
+            stats.match_date,
+            stats.inserted_at,
+            stats.rank,
+          ]
+        )
+      );
+
+      await Promise.all(insertPromises);
+
+      const totalRows = await query(
+        "SELECT COUNT(*) as count FROM match_stats"
+      );
+      if (totalRows[0].count > 5000) {
+        await query(
+          `DELETE FROM match_stats ORDER BY inserted_at ASC LIMIT ${
+            totalRows[0].count - 5000
+          }`
+        );
+      }
+    } else {
+      console.log("Match data is older than 30 days and was not inserted.");
+    }
+
+    return matchData; // Return match data regardless of insertion
   } catch (error) {
-    console.error("Error in getMatchDetails:", error);
-    res.status(500).send(error.toString());
+    if (error.response && error.response.status === 404) {
+      console.warn(`Match ${matchId} not found, skipping.`);
+      return null;
+    } else {
+      console.error(
+        `Error fetching match details for matchId ${matchId}:`,
+        error
+      );
+      throw error;
+    }
   }
 };
 
@@ -202,64 +269,14 @@ const getRecentMatchesDetails = async (req, res) => {
 
     console.log("matchIds", matchIds);
 
-    const matchDetailsPromises = matchIds.map(async (matchId) => {
-      try {
-        const response = await axios.get(
-          `https://europe.api.riotgames.com/lol/match/v5/matches/${matchId}`,
-          {
-            headers: { "X-Riot-Token": RIOT_API_KEY },
-          }
-        );
-
-        const matchData = response.data;
-
-        const playerStats = matchData.info.participants.map((participant) => ({
-          puuid: participant.puuid,
-          match_id: matchId,
-          kills: participant.kills,
-          deaths: participant.deaths,
-          assists: participant.assists,
-          gold_earned: participant.goldEarned,
-          total_minions_killed: participant.totalMinionsKilled,
-          damage_dealt: participant.totalDamageDealtToChampions,
-          game_duration: matchData.info.gameDuration,
-          match_date: new Date(matchData.info.gameCreation)
-            .toISOString()
-            .slice(0, 19)
-            .replace("T", " "),
-        }));
-
-        const insertPromises = playerStats.map((stats) =>
-          query(
-            "INSERT INTO match_stats (puuid, match_id, kills, deaths, assists, gold_earned, total_minions_killed, damage_dealt, game_duration, match_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE match_id = match_id",
-            [
-              stats.puuid,
-              stats.match_id,
-              stats.kills,
-              stats.deaths,
-              stats.assists,
-              stats.gold_earned,
-              stats.total_minions_killed,
-              stats.damage_dealt,
-              stats.game_duration,
-              stats.match_date,
-            ]
-          )
-        );
-
-        await Promise.all(insertPromises);
-
-        return matchData;
-      } catch (error) {
-        console.error(
-          `Error fetching match details for matchId ${matchId}:`,
-          error
-        );
-        throw error;
+    const matchDetails = [];
+    for (const matchId of matchIds) {
+      const matchData = await getMatchDetails(matchId);
+      if (matchData && [420, 430, 450].includes(matchData.info.queueId)) {
+        matchDetails.push(matchData);
       }
-    });
+    }
 
-    const matchDetails = await Promise.all(matchDetailsPromises);
     res.json(matchDetails);
   } catch (error) {
     console.error("Error fetching match details", error);
@@ -322,21 +339,54 @@ const getServerRank = async (req, res) => {
   }
 };
 
-const getAverageStats = async (req, res) => {
+const getStatsByRank = async (req, res) => {
+  const { rank } = req.params;
+  const startTime = Date.now();
+
   try {
-    const avgStats = await query(
-      `SELECT 
-        AVG(kills) as avg_kills,
-        AVG(deaths) as avg_deaths,
-        AVG(assists) as avg_assists,
-        AVG(gold_earned) as avg_gold_earned,
-        AVG(total_minions_killed) as avg_total_minions_killed,
-        AVG(damage_dealt) as avg_damage_dealt
-      FROM match_stats`
-    );
-    res.json(avgStats[0]);
+    const stats = await query(`SELECT * FROM match_stats WHERE rank = ?`, [
+      rank,
+    ]);
+
+    const endTime = Date.now();
+    console.log(`Query executed in ${endTime - startTime} ms`);
+
+    if (stats.length === 0) {
+      return res.status(404).json({ message: "No stats found for this rank" });
+    }
+
+    res.json(stats);
   } catch (error) {
-    res.status(500).send(error.toString());
+    console.error("Error fetching stats by rank:", error);
+    res.status(500).json({ error: "An error occurred while fetching stats" });
+  }
+};
+
+const searchUsers = async (req, res) => {
+  const { query } = req.query;
+
+  if (!query || query.length < 3) {
+    return res
+      .status(400)
+      .json({ error: "Query must be at least 3 characters long" });
+  }
+
+  try {
+    console.log(`Searching for users with query: ${query}`);
+    const db = await connectToMongo();
+    const users = await db
+      .collection("accounts")
+      .find({
+        gameName: new RegExp(query, "i"),
+      })
+      .limit(10)
+      .toArray();
+
+    console.log(`Found users: ${JSON.stringify(users)}`);
+    res.json(users);
+  } catch (error) {
+    console.error("Error fetching users:", error);
+    res.status(500).json({ error: "Error fetching users" });
   }
 };
 
@@ -350,5 +400,6 @@ module.exports = {
   getRecentMatchesDetails,
   getWorldRank,
   getServerRank,
-  getAverageStats,
+  getStatsByRank,
+  searchUsers,
 };
