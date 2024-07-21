@@ -193,7 +193,7 @@ const getMatchDetails = async (matchId) => {
       console.log("Match data is older than 30 days and was not inserted.");
     }
 
-    return matchData; // Return match data regardless of insertion
+    return matchData;
   } catch (error) {
     if (error.response && error.response.status === 404) {
       console.warn(`Match ${matchId} not found, skipping.`);
